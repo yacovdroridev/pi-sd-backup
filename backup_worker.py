@@ -259,6 +259,8 @@ class BackupWorker(QThread):
         transport = self._ssh.get_transport()
         self._channel = transport.open_session()
         self._channel.settimeout(60)
+        # Request separate stderr so we can report dd errors clearly
+        self._channel.set_combine_stderr(False)
         self._channel.exec_command(dd_cmd)
 
         # 6. Stream bytes to local file ─────────────────────────────────────────
@@ -284,7 +286,7 @@ class BackupWorker(QThread):
                         return
 
                     if not chunk:
-                        break  # remote end closed (dd finished)
+                        break  # remote end closed (dd finished or failed)
 
                     img_file.write(chunk)
                     bytes_written += len(chunk)
@@ -301,7 +303,7 @@ class BackupWorker(QThread):
                             )
                     else:
                         # No size known: pulse the bar and log every 100 MiB
-                        self.progress.emit(-1)   # -1 → caller sets indeterminate
+                        self.progress.emit(-1)
                         prev_interval = (bytes_written - len(chunk)) // LOG_INTERVAL
                         curr_interval = bytes_written // LOG_INTERVAL
                         if curr_interval > prev_interval:
@@ -314,8 +316,32 @@ class BackupWorker(QThread):
             self.finished.emit(False, f"File system error: {e}")
             return
 
-        if self._cancel_requested:
-            self.finished.emit(False, "Cancelled.")
+        # 6b. Check exit code and stderr ───────────────────────────────────────
+        exit_code = self._channel.recv_exit_status()   # blocks until dd exits
+        stderr_output = b""
+        while self._channel.recv_stderr_ready():
+            stderr_output += self._channel.recv_stderr(4096)
+        stderr_text = stderr_output.decode(errors="replace").strip()
+
+        if stderr_text:
+            self.log.emit(f"dd stderr: {stderr_text}")
+
+        if exit_code != 0:
+            self.finished.emit(
+                False,
+                f"dd exited with code {exit_code}. "
+                f"Error: {stderr_text or '(no stderr output)'}"
+            )
+            return
+
+        if bytes_written == 0:
+            self.finished.emit(
+                False,
+                f"dd produced no output. "
+                f"Check that '{self.remote_dev}' is correct and the user has "
+                f"sudo/read permission.\n"
+                f"stderr: {stderr_text or '(empty)'}"
+            )
             return
 
         self.progress.emit(100)
