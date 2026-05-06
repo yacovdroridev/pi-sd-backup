@@ -1,14 +1,17 @@
 """
 backup_worker.py
 ----------------
-QThread worker that handles all SSH/Paramiko logic for streaming the remote
-SD card image to a local file.  All heavy I/O runs here so the UI stays
-responsive.
+QThread workers for SSH/Paramiko logic.
+
+Classes:
+  ScanWorker   – connects over SSH and returns available block devices via lsblk
+  BackupWorker – streams a remote block device to a local .img file
 
 Signals emitted to the UI:
-  progress(int)        – 0-100 percentage
-  log(str)             – human-readable status message
-  finished(bool, str)  – success flag + final message
+  progress(int)              – 0-100 percentage  (-1 = indeterminate)
+  log(str)                   – human-readable status message
+  finished(bool, str)        – success flag + final message
+  devices_found(list[str])   – (ScanWorker only) list of device paths
 """
 
 import os
@@ -20,18 +23,105 @@ from PySide6.QtCore import QThread, Signal
 
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-CHUNK_SIZE = 1024 * 1024          # 1 MiB per read
-FREE_SPACE_BUFFER = 2 * 1024 ** 3 # 2 GiB safety margin
+CHUNK_SIZE        = 1024 * 1024          # 1 MiB per read
+FREE_SPACE_BUFFER = 2 * 1024 ** 3        # 2 GiB safety margin
 
 
+def _make_ssh(host, port, username, key_path, password) -> paramiko.SSHClient:
+    """Helper: create and connect a Paramiko SSH client."""
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    ssh.connect(
+        hostname       = host,
+        port           = port,
+        username       = username,
+        key_filename   = key_path or None,
+        password       = password or None,
+        timeout        = 30,
+        banner_timeout = 30,
+        auth_timeout   = 30,
+    )
+    return ssh
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+class ScanWorker(QThread):
+    """
+    Connects via SSH and queries the remote host for block devices using lsblk.
+    Reports results via devices_found(list[str]).
+    Falls back to /proc/partitions if lsblk is not available.
+    """
+
+    log           = Signal(str)         # status text
+    finished      = Signal(bool, str)   # (success, message)
+    devices_found = Signal(list)        # list of '/dev/xxx' strings
+
+    def __init__(self, host, port, username, key_path, password, parent=None):
+        super().__init__(parent)
+        self.host     = host
+        self.port     = port
+        self.username = username
+        self.key_path = key_path
+        self.password = password
+
+    def run(self):
+        self.log.emit(f"Connecting to {self.username}@{self.host}:{self.port} …")
+        try:
+            ssh = _make_ssh(
+                self.host, self.port, self.username, self.key_path, self.password
+            )
+        except paramiko.AuthenticationException:
+            self.finished.emit(False, "Authentication failed – check credentials.")
+            return
+        except Exception as e:
+            self.finished.emit(False, f"Connection failed: {e}")
+            return
+
+        try:
+            devices = self._list_block_devices(ssh)
+        finally:
+            ssh.close()
+
+        if devices:
+            self.log.emit(f"Found {len(devices)} block device(s): {', '.join(devices)}")
+            self.devices_found.emit(devices)
+            self.finished.emit(True, "Scan complete.")
+        else:
+            self.finished.emit(False, "No block devices found on remote host.")
+
+    def _list_block_devices(self, ssh: paramiko.SSHClient) -> list[str]:
+        """
+        Try lsblk first (shows only whole disks, no partitions).
+        Fall back to /proc/partitions if lsblk is absent.
+        """
+        # lsblk: list only disk-type devices (not partitions), output bare paths
+        cmd = "lsblk -d -n -o NAME,TYPE 2>/dev/null | awk '$2==\"disk\"{print \"/dev/\"$1}'"
+        _, stdout, _ = ssh.exec_command(cmd, timeout=15)
+        devices = [l.strip() for l in stdout.read().decode().splitlines() if l.strip()]
+
+        if not devices:
+            self.log.emit("lsblk unavailable, falling back to /proc/partitions …")
+            # /proc/partitions: major minor #blocks name
+            # Keep only whole-disk entries (e.g. mmcblk0, sda) – exclude partitions
+            cmd2 = (
+                "awk 'NR>2 && $4!=\"\" && $4!~/[0-9]p?[0-9]+$/{print \"/dev/\"$4}'"
+                " /proc/partitions"
+            )
+            _, stdout2, _ = ssh.exec_command(cmd2, timeout=15)
+            devices = [l.strip() for l in stdout2.read().decode().splitlines() if l.strip()]
+
+        return devices
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 class BackupWorker(QThread):
     """
-    Streams /dev/mmcblk0 (or any remote block device / file) from a Raspberry
-    Pi over SSH and writes the raw bytes to a local .img file.
+    Streams a remote block device from a Raspberry Pi over SSH and writes
+    the raw bytes to a local .img file.
     """
 
     # ── Signals ────────────────────────────────────────────────────────────────
-    progress = Signal(int)          # 0-100
+    progress = Signal(int)          # 0-100, or -1 for indeterminate
     log      = Signal(str)          # status text
     finished = Signal(bool, str)    # (success, message)
 
@@ -40,7 +130,8 @@ class BackupWorker(QThread):
         self,
         host:        str,
         username:    str,
-        key_path:    str,
+        key_path:    str | None,
+        password:    str | None,
         remote_dev:  str,
         dest_path:   str,
         shrink:      bool = False,
@@ -51,8 +142,9 @@ class BackupWorker(QThread):
         self.host       = host
         self.username   = username
         self.key_path   = key_path
-        self.remote_dev = remote_dev   # e.g. /dev/mmcblk0
-        self.dest_path  = dest_path    # local .img file
+        self.password   = password
+        self.remote_dev = remote_dev
+        self.dest_path  = dest_path
         self.shrink     = shrink
         self.port       = port
 
@@ -96,21 +188,12 @@ class BackupWorker(QThread):
 
         # 2. Connect via SSH ────────────────────────────────────────────────────
         self.log.emit(f"Connecting to {self.username}@{self.host}:{self.port} …")
-        self._ssh = paramiko.SSHClient()
-        self._ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
         try:
-            self._ssh.connect(
-                hostname     = self.host,
-                port         = self.port,
-                username     = self.username,
-                key_filename = self.key_path,
-                timeout      = 30,
-                banner_timeout = 30,
-                auth_timeout = 30,
+            self._ssh = _make_ssh(
+                self.host, self.port, self.username, self.key_path, self.password
             )
         except paramiko.AuthenticationException:
-            self.finished.emit(False, "Authentication failed – check key path / username.")
+            self.finished.emit(False, "Authentication failed – check credentials.")
             return
         except (socket.timeout, paramiko.ssh_exception.NoValidConnectionsError) as e:
             self.finished.emit(False, f"Connection failed: {e}")
@@ -129,63 +212,59 @@ class BackupWorker(QThread):
 
     def _stream_image(self, free_bytes: int) -> None:
         """
-        Query remote device size, validate free space, then stream bytes.
+        Query remote device size (best-effort), validate free space if known,
+        then stream bytes.  If size cannot be determined, streaming continues
+        without a progress percentage.
         """
-        # 3. Determine remote device size ──────────────────────────────────────
+        # 3. Determine remote device size (best-effort) ────────────────────────
         self.log.emit(f"Querying size of {self.remote_dev} …")
-        size_cmd = f"sudo blockdev --getsize64 {self.remote_dev}"
-        stdin, stdout, stderr = self._ssh.exec_command(size_cmd, timeout=15)
-        err_output = stderr.read().decode().strip()
-        size_output = stdout.read().decode().strip()
+        remote_size: int | None = None
 
-        if not size_output.isdigit():
-            # Fallback: try /proc/partitions or stat
+        for cmd in (
+            f"sudo blockdev --getsize64 {self.remote_dev}",
+            f"sudo fdisk -s {self.remote_dev} 2>/dev/null | awk '{{print $1*512}}'",
+        ):
+            try:
+                _, stdout, _ = self._ssh.exec_command(cmd, timeout=15)
+                out = stdout.read().decode().strip()
+                if out.isdigit() and int(out) > 0:
+                    remote_size = int(out)
+                    break
+            except Exception:
+                pass
+
+        if remote_size:
+            self.log.emit(f"Remote device size: {remote_size / 1024**3:.2f} GiB")
+        else:
             self.log.emit(
-                f"blockdev failed ({err_output}), trying wc -c fallback …"
+                "Warning: could not determine remote device size – "
+                "skipping disk space check, progress will show MiB written."
             )
-            # Note: this will read the whole device, so it may be slow/fail.
-            size_cmd2 = f"sudo wc -c < {self.remote_dev}"
-            _, stdout2, _ = self._ssh.exec_command(size_cmd2, timeout=15)
-            size_output = stdout2.read().decode().strip()
 
-        try:
-            remote_size = int(size_output)
-        except ValueError:
-            self.finished.emit(
-                False,
-                f"Could not determine remote device size. Output: '{size_output}'"
-            )
-            return
-
-        remote_size_gb = remote_size / 1024 ** 3
-        self.log.emit(f"Remote device size: {remote_size_gb:.2f} GiB")
-
-        # 4. Validate disk space ────────────────────────────────────────────────
-        required = remote_size + FREE_SPACE_BUFFER
-        if free_bytes < required:
-            needed_gb  = required / 1024 ** 3
-            free_gb    = free_bytes / 1024 ** 3
-            self.finished.emit(
-                False,
-                f"Not enough disk space. Need {needed_gb:.1f} GiB, "
-                f"have {free_gb:.1f} GiB."
-            )
-            return
+        # 4. Validate disk space (only when size is known) ─────────────────────
+        if remote_size:
+            required = remote_size + FREE_SPACE_BUFFER
+            if free_bytes < required:
+                self.finished.emit(
+                    False,
+                    f"Not enough disk space. Need {required/1024**3:.1f} GiB, "
+                    f"have {free_bytes/1024**3:.1f} GiB."
+                )
+                return
 
         # 5. Open transport channel for the dd command ─────────────────────────
-        dd_cmd = (
-            f"sudo dd if={self.remote_dev} bs={CHUNK_SIZE} status=none"
-        )
+        dd_cmd = f"sudo dd if={self.remote_dev} bs={CHUNK_SIZE} status=none"
         self.log.emit(f"Starting stream: {dd_cmd}")
 
         transport = self._ssh.get_transport()
         self._channel = transport.open_session()
-        self._channel.settimeout(60)          # seconds between chunks
+        self._channel.settimeout(60)
         self._channel.exec_command(dd_cmd)
 
         # 6. Stream bytes to local file ─────────────────────────────────────────
         bytes_written = 0
         last_pct      = -1
+        LOG_INTERVAL  = 100 * 1024 * 1024   # log every 100 MiB when size unknown
 
         try:
             with open(self.dest_path, "wb") as img_file:
@@ -209,15 +288,24 @@ class BackupWorker(QThread):
 
                     img_file.write(chunk)
                     bytes_written += len(chunk)
+                    mb = bytes_written / 1024 ** 2
 
-                    pct = min(int(bytes_written * 100 / remote_size), 100)
-                    if pct != last_pct:
-                        self.progress.emit(pct)
-                        last_pct = pct
-                        mb = bytes_written / 1024 ** 2
-                        self.log.emit(
-                            f"Streamed {mb:.0f} MiB / {remote_size_gb:.1f} GiB  ({pct}%)"
-                        )
+                    if remote_size:
+                        pct = min(int(bytes_written * 100 / remote_size), 100)
+                        if pct != last_pct:
+                            self.progress.emit(pct)
+                            last_pct = pct
+                            self.log.emit(
+                                f"Streamed {mb:.0f} MiB / "
+                                f"{remote_size/1024**3:.1f} GiB  ({pct}%)"
+                            )
+                    else:
+                        # No size known: pulse the bar and log every 100 MiB
+                        self.progress.emit(-1)   # -1 → caller sets indeterminate
+                        prev_interval = (bytes_written - len(chunk)) // LOG_INTERVAL
+                        curr_interval = bytes_written // LOG_INTERVAL
+                        if curr_interval > prev_interval:
+                            self.log.emit(f"Streamed {mb:.0f} MiB …")
 
         except PermissionError as e:
             self.finished.emit(False, f"Cannot write to destination: {e}")

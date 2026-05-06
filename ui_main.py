@@ -28,9 +28,10 @@ from PySide6.QtWidgets import (
     QGroupBox, QLabel, QLineEdit, QPushButton,
     QProgressBar, QTextEdit, QCheckBox, QFileDialog,
     QSpinBox, QStatusBar, QSizePolicy, QMessageBox,
+    QComboBox,
 )
 
-from backup_worker import BackupWorker
+from backup_worker import BackupWorker, ScanWorker
 
 
 APP_NAME    = "Pi SD Backup"
@@ -46,6 +47,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(APP_NAME)
         self.setMinimumSize(700, 620)
         self._worker: BackupWorker | None = None
+        self._scan_worker: ScanWorker | None = None
 
         self._settings = QSettings(SETTINGS_FILE, QSettings.Format.IniFormat)
 
@@ -120,11 +122,22 @@ class MainWindow(QMainWindow):
         self.inp_password.setPlaceholderText("SSH password or key passphrase  [leave blank if not needed]")
         form.addLayout(row("Password:", self.inp_password))
 
-        # Remote device
-        self.inp_remote = QLineEdit()
-        self.inp_remote.setPlaceholderText("e.g. /dev/mmcblk0")
-        self.inp_remote.setText("/dev/mmcblk0")
-        form.addLayout(row("Remote Device:", self.inp_remote))
+        # Remote device – combobox populated by Scan
+        dev_lbl = QLabel("Remote Device:")
+        dev_lbl.setFixedWidth(130)
+        self.cmb_remote = QComboBox()
+        self.cmb_remote.setEditable(True)           # allow typing manually too
+        self.cmb_remote.setMinimumWidth(160)
+        self.cmb_remote.addItem("/dev/mmcblk0")     # sensible default
+        self.btn_scan = QPushButton("Scan")
+        self.btn_scan.setFixedWidth(90)
+        self.btn_scan.setToolTip("Connect and list available block devices on the remote host")
+        self.btn_scan.clicked.connect(self._on_scan)
+        h_dev = QHBoxLayout()
+        h_dev.addWidget(dev_lbl)
+        h_dev.addWidget(self.cmb_remote)
+        h_dev.addWidget(self.btn_scan)
+        form.addLayout(h_dev)
 
         # Destination file
         dest_lbl = QLabel("Destination File:")
@@ -201,6 +214,45 @@ class MainWindow(QMainWindow):
         return h
 
     # ── Slots – UI interactions ────────────────────────────────────────────────
+    def _on_scan(self) -> None:
+        """Launch ScanWorker to discover block devices on the remote host."""
+        host = self.inp_host.text().strip()
+        user = self.inp_user.text().strip()
+        if not host or not user:
+            QMessageBox.warning(self, "Missing Input", "Enter Host and Username before scanning.")
+            return
+
+        self.btn_scan.setEnabled(False)
+        self.btn_scan.setText("Scanning…")
+        self._append_log(f"Scanning block devices on {host} …")
+
+        self._scan_worker = ScanWorker(
+            host     = host,
+            port     = self.inp_port.value(),
+            username = user,
+            key_path = self.inp_key.text().strip() or None,
+            password = self.inp_password.text() or None,
+        )
+        self._scan_worker.log.connect(self._append_log)
+        self._scan_worker.devices_found.connect(self._on_devices_found)
+        self._scan_worker.finished.connect(self._on_scan_finished)
+        self._scan_worker.start()
+
+    def _on_devices_found(self, devices: list) -> None:
+        current = self.cmb_remote.currentText()
+        self.cmb_remote.clear()
+        for dev in devices:
+            self.cmb_remote.addItem(dev)
+        # Restore previous selection if still present, else pick first
+        idx = self.cmb_remote.findText(current)
+        self.cmb_remote.setCurrentIndex(idx if idx >= 0 else 0)
+
+    def _on_scan_finished(self, success: bool, message: str) -> None:
+        self.btn_scan.setEnabled(True)
+        self.btn_scan.setText("Scan")
+        if not success:
+            QMessageBox.warning(self, "Scan Failed", message)
+
     def _browse_key(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self, "Select SSH Private Key", os.path.expanduser("~/.ssh"),
@@ -231,7 +283,7 @@ class MainWindow(QMainWindow):
             username   = self.inp_user.text().strip(),
             key_path   = self.inp_key.text().strip() or None,
             password   = self.inp_password.text() or None,
-            remote_dev = self.inp_remote.text().strip(),
+            remote_dev = self.cmb_remote.currentText().strip(),
             dest_path  = self.inp_dest.text().strip(),
             shrink     = self.chk_shrink.isChecked(),
             port       = self.inp_port.value(),
@@ -239,7 +291,7 @@ class MainWindow(QMainWindow):
 
         # Connect signals
         self._worker.log.connect(self._append_log)
-        self._worker.progress.connect(self.progress_bar.setValue)
+        self._worker.progress.connect(self._on_progress)
         self._worker.finished.connect(self._on_backup_finished)
 
         self._worker.start()
@@ -251,6 +303,15 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Cancelling …")
 
     # ── Slots – worker signals ─────────────────────────────────────────────────
+    def _on_progress(self, value: int) -> None:
+        if value == -1:
+            # Size unknown – switch to indeterminate (marquee) mode
+            self.progress_bar.setRange(0, 0)
+        else:
+            if self.progress_bar.maximum() == 0:
+                self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(value)
+
     def _append_log(self, message: str) -> None:
         self.log_view.append(message)
         # Auto-scroll to bottom
@@ -282,8 +343,8 @@ class MainWindow(QMainWindow):
             errors.append("• Provide either an SSH Key path or a Password (or both).")
         elif key and not os.path.isfile(key):
             errors.append(f"• SSH Key file not found: {key}")
-        if not self.inp_remote.text().strip():
-            errors.append("• Remote device path is required.")
+        if not self.cmb_remote.currentText().strip():
+            errors.append("• Remote device path is required (use Scan or type manually).")
         if not self.inp_dest.text().strip():
             errors.append("• Destination file path is required.")
 
@@ -297,6 +358,7 @@ class MainWindow(QMainWindow):
 
     def _reset_ui_for_backup(self) -> None:
         self.log_view.clear()
+        self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         self.btn_start.setEnabled(False)
         self.btn_cancel.setEnabled(True)
@@ -315,7 +377,7 @@ class MainWindow(QMainWindow):
         s.setValue("user",    self.inp_user.text())
         s.setValue("key",     self.inp_key.text())
         # NOTE: password is intentionally NOT saved to disk for security.
-        s.setValue("remote",  self.inp_remote.text())
+        s.setValue("remote",  self.cmb_remote.currentText())
         s.setValue("dest",    self.inp_dest.text())
         s.setValue("shrink",  self.chk_shrink.isChecked())
 
@@ -326,7 +388,10 @@ class MainWindow(QMainWindow):
         self.inp_user.setText(s.value("user",   "pi"))
         self.inp_key.setText(s.value("key",     ""))
         # Password is never persisted; always starts blank.
-        self.inp_remote.setText(s.value("remote", "/dev/mmcblk0"))
+        saved_remote = s.value("remote", "/dev/mmcblk0")
+        if self.cmb_remote.findText(saved_remote) == -1:
+            self.cmb_remote.addItem(saved_remote)
+        self.cmb_remote.setCurrentText(saved_remote)
         self.inp_dest.setText(s.value("dest",   ""))
         shrink = s.value("shrink", False)
         # QSettings returns strings on some platforms
