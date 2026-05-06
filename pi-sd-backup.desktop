@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Pi SD Backup
+Comment=Stream and backup a Raspberry Pi SD card over SSH
+Exec=/opt/pi-sd-backup/pi_sd_backup
+Icon=/opt/pi-sd-backup/assets/icon.png
+Terminal=false
+Categories=Utility;System;
+StartupWMClass=PiSdBackup
