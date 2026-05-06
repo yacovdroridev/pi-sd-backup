@@ -163,7 +163,13 @@ class MainWindow(QMainWindow):
             "Shrink image after backup  "
             "(requires PiShrink in PATH)"
         )
+        self.chk_verify = QCheckBox(
+            "Verify after backup  "
+            "(SHA256 remote vs local)"
+        )
         h.addWidget(self.chk_shrink)
+        h.addSpacing(20)
+        h.addWidget(self.chk_verify)
         h.addStretch()
         return box
 
@@ -177,6 +183,13 @@ class MainWindow(QMainWindow):
         self.progress_bar.setTextVisible(True)
         self.progress_bar.setFixedHeight(26)
         v.addWidget(self.progress_bar)
+
+        self.lbl_speed = QLabel("Speed: —    ETA: —")
+        self.lbl_speed.setAlignment(Qt.AlignmentFlag.AlignRight)
+        font = self.lbl_speed.font()
+        font.setPointSize(font.pointSize() - 1)
+        self.lbl_speed.setFont(font)
+        v.addWidget(self.lbl_speed)
         return box
 
     # ── Log group ──────────────────────────────────────────────────────────────
@@ -286,12 +299,14 @@ class MainWindow(QMainWindow):
             remote_dev = self.cmb_remote.currentText().strip(),
             dest_path  = self.inp_dest.text().strip(),
             shrink     = self.chk_shrink.isChecked(),
+            verify     = self.chk_verify.isChecked(),
             port       = self.inp_port.value(),
         )
 
         # Connect signals
         self._worker.log.connect(self._append_log)
         self._worker.progress.connect(self._on_progress)
+        self._worker.speed_update.connect(self._on_speed_update)
         self._worker.finished.connect(self._on_backup_finished)
 
         self._worker.start()
@@ -305,12 +320,29 @@ class MainWindow(QMainWindow):
     # ── Slots – worker signals ─────────────────────────────────────────────────
     def _on_progress(self, value: int) -> None:
         if value == -1:
-            # Size unknown – switch to indeterminate (marquee) mode
             self.progress_bar.setRange(0, 0)
         else:
             if self.progress_bar.maximum() == 0:
                 self.progress_bar.setRange(0, 100)
             self.progress_bar.setValue(value)
+
+    def _on_speed_update(self, speed_mbs: float, eta_sec: float) -> None:
+        if eta_sec >= 0:
+            h   = int(eta_sec) // 3600
+            m   = (int(eta_sec) % 3600) // 60
+            s   = int(eta_sec) % 60
+            if h > 0:
+                eta_str = f"{h}h {m:02d}m {s:02d}s"
+            elif m > 0:
+                eta_str = f"{m}m {s:02d}s"
+            else:
+                eta_str = f"{s}s"
+        else:
+            eta_str = "—"
+
+        text = f"Speed: {speed_mbs:.1f} MB/s    ETA: {eta_str}"
+        self.lbl_speed.setText(text)
+        self.statusBar().showMessage(text)
 
     def _append_log(self, message: str) -> None:
         self.log_view.append(message)
@@ -360,6 +392,7 @@ class MainWindow(QMainWindow):
         self.log_view.clear()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
+        self.lbl_speed.setText("Speed: —    ETA: —")
         self.btn_start.setEnabled(False)
         self.btn_cancel.setEnabled(True)
         self.statusBar().showMessage("Starting backup …")
@@ -367,6 +400,7 @@ class MainWindow(QMainWindow):
     def _reset_ui_idle(self) -> None:
         self.btn_start.setEnabled(True)
         self.btn_cancel.setEnabled(False)
+        self.lbl_speed.setText("Speed: —    ETA: —")
         self.statusBar().showMessage("Idle.")
 
     # ── Settings persistence ───────────────────────────────────────────────────
@@ -380,6 +414,7 @@ class MainWindow(QMainWindow):
         s.setValue("remote",  self.cmb_remote.currentText())
         s.setValue("dest",    self.inp_dest.text())
         s.setValue("shrink",  self.chk_shrink.isChecked())
+        s.setValue("verify",  self.chk_verify.isChecked())
 
     def _load_settings(self) -> None:
         s = self._settings
@@ -394,10 +429,14 @@ class MainWindow(QMainWindow):
         self.cmb_remote.setCurrentText(saved_remote)
         self.inp_dest.setText(s.value("dest",   ""))
         shrink = s.value("shrink", False)
-        # QSettings returns strings on some platforms
         if isinstance(shrink, str):
             shrink = shrink.lower() == "true"
         self.chk_shrink.setChecked(bool(shrink))
+
+        verify = s.value("verify", False)
+        if isinstance(verify, str):
+            verify = verify.lower() == "true"
+        self.chk_verify.setChecked(bool(verify))
 
     # ── Window close ──────────────────────────────────────────────────────────
     def closeEvent(self, event) -> None:

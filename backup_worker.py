@@ -11,12 +11,15 @@ Signals emitted to the UI:
   progress(int)              – 0-100 percentage  (-1 = indeterminate)
   log(str)                   – human-readable status message
   finished(bool, str)        – success flag + final message
+  speed_update(float, float) – (BackupWorker) current MB/s, ETA seconds (-1 if unknown)
   devices_found(list[str])   – (ScanWorker only) list of device paths
 """
 
+import hashlib
 import os
 import shutil
 import socket
+import time
 
 import paramiko
 from PySide6.QtCore import QThread, Signal
@@ -121,9 +124,10 @@ class BackupWorker(QThread):
     """
 
     # ── Signals ────────────────────────────────────────────────────────────────
-    progress = Signal(int)          # 0-100, or -1 for indeterminate
-    log      = Signal(str)          # status text
-    finished = Signal(bool, str)    # (success, message)
+    progress     = Signal(int)            # 0-100, or -1 for indeterminate
+    log          = Signal(str)            # status text
+    finished     = Signal(bool, str)      # (success, message)
+    speed_update = Signal(float, float)   # (MB/s, ETA seconds)  ETA=-1 if unknown
 
     # ── Constructor ────────────────────────────────────────────────────────────
     def __init__(
@@ -135,6 +139,7 @@ class BackupWorker(QThread):
         remote_dev:  str,
         dest_path:   str,
         shrink:      bool = False,
+        verify:      bool = False,
         port:        int  = 22,
         parent=None,
     ):
@@ -146,6 +151,7 @@ class BackupWorker(QThread):
         self.remote_dev = remote_dev
         self.dest_path  = dest_path
         self.shrink     = shrink
+        self.verify     = verify
         self.port       = port
 
         self._cancel_requested = False
@@ -273,9 +279,14 @@ class BackupWorker(QThread):
         self._channel.shutdown_write()   # EOF on stdin — dd reads from device, not stdin
 
         # 6. Stream bytes to local file ─────────────────────────────────────────
-        bytes_written = 0
-        last_pct      = -1
-        LOG_INTERVAL  = 100 * 1024 * 1024   # log every 100 MiB when size unknown
+        bytes_written  = 0
+        last_pct       = -1
+        LOG_INTERVAL   = 100 * 1024 * 1024   # log every 100 MiB when size unknown
+        SPEED_INTERVAL = 2.0                  # recalculate speed every 2 s
+
+        t_start        = time.monotonic()
+        t_last_speed   = t_start
+        bytes_at_last  = 0
 
         try:
             with open(self.dest_path, "wb") as img_file:
@@ -299,8 +310,26 @@ class BackupWorker(QThread):
 
                     img_file.write(chunk)
                     bytes_written += len(chunk)
-                    mb = bytes_written / 1024 ** 2
 
+                    now      = time.monotonic()
+                    elapsed  = now - t_last_speed
+
+                    # Recalculate speed every SPEED_INTERVAL seconds
+                    if elapsed >= SPEED_INTERVAL:
+                        window_bytes = bytes_written - bytes_at_last
+                        speed_mbs    = (window_bytes / elapsed) / (1024 * 1024)
+                        bytes_at_last  = bytes_written
+                        t_last_speed   = now
+
+                        if remote_size and speed_mbs > 0:
+                            remaining = remote_size - bytes_written
+                            eta_sec   = remaining / (speed_mbs * 1024 * 1024)
+                        else:
+                            eta_sec = -1.0
+
+                        self.speed_update.emit(speed_mbs, eta_sec)
+
+                    mb = bytes_written / 1024 ** 2
                     if remote_size:
                         pct = min(int(bytes_written * 100 / remote_size), 100)
                         if pct != last_pct:
@@ -311,7 +340,6 @@ class BackupWorker(QThread):
                                 f"{remote_size/1024**3:.1f} GiB  ({pct}%)"
                             )
                     else:
-                        # No size known: pulse the bar and log every 100 MiB
                         self.progress.emit(-1)
                         prev_interval = (bytes_written - len(chunk)) // LOG_INTERVAL
                         curr_interval = bytes_written // LOG_INTERVAL
@@ -360,11 +388,88 @@ class BackupWorker(QThread):
             f"{self.dest_path}"
         )
 
-        # 7. Optional: shrink the image ────────────────────────────────────────
-        if self.shrink:
+        # 7. Optional: verify ──────────────────────────────────────────────────
+        if self.verify:
+            self._verify_image()
+        elif self.shrink:
             self._shrink_image()
         else:
             self.finished.emit(True, "Backup completed successfully.")
+
+    def _verify_image(self) -> None:
+        """
+        Compute SHA256 of the local image and compare it against a SHA256
+        of the remote device.  Reports pass/fail then optionally shrinks.
+        """
+        self.log.emit("Verifying backup integrity (SHA256) …")
+
+        # Local hash
+        self.log.emit("  Hashing local image …")
+        sha_local = hashlib.sha256()
+        try:
+            with open(self.dest_path, "rb") as f:
+                while True:
+                    if self._cancel_requested:
+                        self.finished.emit(False, "Cancelled during verification.")
+                        return
+                    block = f.read(CHUNK_SIZE)
+                    if not block:
+                        break
+                    sha_local.update(block)
+        except OSError as e:
+            self.log.emit(f"  Local hash error: {e}")
+            self._finish_after_verify(verified=False)
+            return
+
+        local_digest = sha_local.hexdigest()
+        self.log.emit(f"  Local  SHA256: {local_digest}")
+
+        # Remote hash via sudo sha256sum
+        self.log.emit(f"  Hashing remote {self.remote_dev} (this may take a while) …")
+        hash_cmd = f"sudo -S sha256sum {self.remote_dev}"
+        transport = self._ssh.get_transport()
+        chan = transport.open_session()
+        chan.set_combine_stderr(False)
+        chan.exec_command(hash_cmd)
+        if self.password:
+            chan.sendall((self.password + "\n").encode())
+        chan.shutdown_write()
+
+        raw = b""
+        while True:
+            chunk = chan.recv(65536)
+            if not chunk:
+                break
+            raw += chunk
+
+        chan.recv_exit_status()
+        chan.close()
+
+        remote_output = raw.decode(errors="replace").strip()
+        # sha256sum output: "<hash>  <filename>"
+        remote_digest = remote_output.split()[0] if remote_output else ""
+        self.log.emit(f"  Remote SHA256: {remote_digest}")
+
+        if local_digest and local_digest == remote_digest:
+            self.log.emit("  Verification PASSED – image matches remote device.")
+            self._finish_after_verify(verified=True)
+        else:
+            self.log.emit("  Verification FAILED – digests do not match!")
+            self.finished.emit(
+                False,
+                "Backup verification failed: SHA256 mismatch.\n"
+                f"  Local : {local_digest}\n"
+                f"  Remote: {remote_digest}"
+            )
+
+    def _finish_after_verify(self, verified: bool) -> None:
+        """After verification, continue to shrink if requested."""
+        if not verified:
+            return
+        if self.shrink:
+            self._shrink_image()
+        else:
+            self.finished.emit(True, "Backup completed and verified successfully.")
 
     def _shrink_image(self) -> None:
         """
