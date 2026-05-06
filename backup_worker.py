@@ -253,15 +253,24 @@ class BackupWorker(QThread):
                 return
 
         # 5. Open transport channel for the dd command ─────────────────────────
-        dd_cmd = f"sudo dd if={self.remote_dev} bs={CHUNK_SIZE} status=none"
+        # Use `sudo -S` so sudo reads the password from stdin — no PTY needed,
+        # which keeps stdout as clean binary (no prompt text mixed in).
+        # stderr is kept separate so error messages don't corrupt the image data.
+        dd_cmd = (
+            f"sudo -S dd if={self.remote_dev} bs={CHUNK_SIZE} status=none"
+        )
         self.log.emit(f"Starting stream: {dd_cmd}")
 
         transport = self._ssh.get_transport()
         self._channel = transport.open_session()
         self._channel.settimeout(60)
-        # Request separate stderr so we can report dd errors clearly
-        self._channel.set_combine_stderr(False)
+        self._channel.set_combine_stderr(False)   # keep stderr separate from binary stdout
         self._channel.exec_command(dd_cmd)
+
+        # Feed sudo password via stdin then close it
+        if self.password:
+            self._channel.sendall((self.password + "\n").encode())
+        self._channel.shutdown_write()   # EOF on stdin — dd reads from device, not stdin
 
         # 6. Stream bytes to local file ─────────────────────────────────────────
         bytes_written = 0
@@ -316,8 +325,8 @@ class BackupWorker(QThread):
             self.finished.emit(False, f"File system error: {e}")
             return
 
-        # 6b. Check exit code and stderr ───────────────────────────────────────
-        exit_code = self._channel.recv_exit_status()   # blocks until dd exits
+        # 6b. Check exit code and stderr ──────────────────────────────────────
+        exit_code = self._channel.recv_exit_status()
         stderr_output = b""
         while self._channel.recv_stderr_ready():
             stderr_output += self._channel.recv_stderr(4096)
@@ -330,7 +339,9 @@ class BackupWorker(QThread):
             self.finished.emit(
                 False,
                 f"dd exited with code {exit_code}. "
-                f"Error: {stderr_text or '(no stderr output)'}"
+                f"Error: {stderr_text or '(no stderr)'}\n\n"
+                f"Tip: ensure the user can run 'sudo dd' — either by providing "
+                f"the correct password or configuring passwordless sudo for dd."
             )
             return
 
@@ -339,8 +350,7 @@ class BackupWorker(QThread):
                 False,
                 f"dd produced no output. "
                 f"Check that '{self.remote_dev}' is correct and the user has "
-                f"sudo/read permission.\n"
-                f"stderr: {stderr_text or '(empty)'}"
+                f"sudo/read permission.\nstderr: {stderr_text or '(empty)'}"
             )
             return
 
